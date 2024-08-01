@@ -1,0 +1,7 @@
+{
+  "auth_token": "your_generated_token",
+  "servers": [
+    {"name":"exampleserver1","address":"127.0.0.1:25566"},
+    {"name":"exampleserver2","address":"127.0.0.1:25567"}
+  ]
+}
