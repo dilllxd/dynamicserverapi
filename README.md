@@ -121,6 +121,7 @@ http GET http://localhost:8080/listservers Authorization:"your_generated_token"
 - **Admin-Added Servers:** Servers that were added to the proxy before the plugin initializes are marked as admin-added. These servers cannot be removed using the REST API to ensure they remain in the proxy unless explicitly managed by the admin.
 - **Authorization Token:** Ensure you keep your `auth_token` secure and update the `servers.json` file if you need to change it.
 - **Server Persistence:** When a server is added through the REST API, it is saved to the `servers.json` file. Upon each server restart, the plugin reads the `servers.json` file and registers all non-admin servers listed. Admin-added servers (those present before the plugin initializes) are preserved but not modified by the plugin.
+- **REST API:** For now the REST API currently binds to all available network interfaces and the port 8080. This will be configurable soon.
 ---
 
 Feel free to reach out if you have any questions or need further assistance with setting up the DynamicServerAPI plugin for Gate.
