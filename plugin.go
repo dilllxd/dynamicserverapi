@@ -6,13 +6,22 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
+	"github.com/robinbraemer/event"
+	"go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
+)
+
+const (
+	CurrentVersion = "1.0.0"
 )
 
 // Mutex for synchronizing server access
@@ -20,7 +29,9 @@ var (
 	serverMutex  sync.Mutex
 	serversFile  = "servers.json" // File to store server information
 	adminServers = make(map[string]bool)
-	authToken    = "" // Authorization token
+	authToken    = ""        // Authorization token
+	apiPort      = 8080      // Default port
+	apiInterface = "0.0.0.0" // Default interface
 )
 
 // Plugin is a plugin that hosts a REST API to manage servers with persistence.
@@ -29,7 +40,17 @@ var Plugin = proxy.Plugin{
 	Init: func(ctx context.Context, p *proxy.Proxy) error {
 		// Get the logger for this plugin.
 		logger := logr.FromContextOrDiscard(ctx)
-		logger.Info("Hello from DynamicServerAPI plugin!")
+		logger.Info(fmt.Sprintf("DynamicServerAPI: Hello from DynamicServerAPI! Version %s", CurrentVersion))
+
+		// Check for updates.
+		hasUpdate, latestVersion, err := CheckForUpdates()
+		if err != nil {
+			logger.Error(err, "DynamicServerAPI: Error checking for updates")
+		} else if hasUpdate {
+			logger.Info(fmt.Sprintf("DynamicServerAPI: A new version %s is available. Please update!", latestVersion))
+		} else {
+			logger.Info("DynamicServerAPI: You are using the latest version.")
+		}
 
 		// Track initial admin-added servers.
 		for _, server := range p.Servers() {
@@ -39,9 +60,13 @@ var Plugin = proxy.Plugin{
 
 		// Load servers from file and set the authorization token.
 		if err := loadConfigFromFile(p); err != nil {
-			logger.Error(err, "Failed to load servers from file")
+			logger.Error(err, "DynamicServerAPI: Failed to load servers from file")
 			return err
 		}
+
+		// Register event handlers.
+		event.Subscribe(p.Event(), 0, onPlayerChooseInitialServer(p, logger))
+		event.Subscribe(p.Event(), 0, onKickedFromServer(p, logger))
 
 		// Start the REST API server.
 		go func() {
@@ -54,8 +79,9 @@ var Plugin = proxy.Plugin{
 
 // Server represents a server entry.
 type Server struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
+	Name     string `json:"name"`
+	Address  string `json:"address"`
+	Fallback bool   `json:"fallback"`
 }
 
 // ConcreteServerInfo is a concrete implementation of ServerInfo.
@@ -72,6 +98,66 @@ func (c *ConcreteServerInfo) Addr() net.Addr {
 	return c.address
 }
 
+type DisconnectKickResult struct {
+	Message component.Component
+}
+
+// Function to check for updates.
+func CheckForUpdates() (bool, string, error) {
+	const versionURL = "https://raw.githubusercontent.com/dilllxd/dynamicserverapi/main/version"
+	resp, err := http.Get(versionURL)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, "", fmt.Errorf("DynamicServerAPI: failed to fetch version file: %s", resp.Status)
+	}
+
+	latestVersion, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, "", err
+	}
+
+	latestVersionStr := strings.TrimSpace(string(latestVersion))
+	if !isValidSemver(latestVersionStr) {
+		return false, "", fmt.Errorf("DynamicServerAPI: invalid version format: %s", latestVersionStr)
+	}
+
+	return isNewerVersion(latestVersionStr, CurrentVersion), latestVersionStr, nil
+}
+
+// Helper functions for version checking
+func isValidSemver(version string) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if _, err := strconv.Atoi(part); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func isNewerVersion(latest, current string) bool {
+	latestParts := strings.Split(latest, ".")
+	currentParts := strings.Split(current, ".")
+
+	for i := 0; i < 3; i++ {
+		latestPart := latestParts[i]
+		currentPart := currentParts[i]
+		if latestPart > currentPart {
+			return true
+		} else if latestPart < currentPart {
+			return false
+		}
+	}
+	return false
+}
+
 // startAPIServer starts the internal HTTP server.
 func startAPIServer(logger logr.Logger, p *proxy.Proxy) {
 	http.HandleFunc("/addserver", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -81,18 +167,17 @@ func startAPIServer(logger logr.Logger, p *proxy.Proxy) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if err := addServer(p, server.Name, server.Address); err != nil {
+			if err := addServer(p, server.Name, server.Address, server.Fallback); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			// Save the new server to the file
 			if err := saveServersToFile(p, &server, nil); err != nil {
-				http.Error(w, "Failed to save server", http.StatusInternalServerError)
+				http.Error(w, "DynamicServerAPI: Failed to save server, check your logs.", http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
 		} else {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+			http.Error(w, "DynamicServerAPI: Invalid request method, you need to use POST.", http.StatusMethodNotAllowed)
 		}
 	}))
 
@@ -104,45 +189,44 @@ func startAPIServer(logger logr.Logger, p *proxy.Proxy) {
 				return
 			}
 			if adminServers[server.Name] {
-				http.Error(w, "Cannot remove admin-added server", http.StatusForbidden)
+				http.Error(w, "DynamicServerAPI: Cannot remove admin-added server, make sure your server is not already in config.yml.", http.StatusForbidden)
 				return
 			}
 			if err := removeServer(p, server.Name); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			// Remove the server from the saved file
 			if err := saveServersToFile(p, nil, &server); err != nil {
-				http.Error(w, "Failed to save servers", http.StatusInternalServerError)
+				http.Error(w, "DynamicServerAPI: Failed to save servers, check your logs.", http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
 		} else {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+			http.Error(w, "DynamicServerAPI: Invalid request method, you need to use POST.", http.StatusMethodNotAllowed)
 		}
 	}))
 
 	http.HandleFunc("/listservers", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			servers, err := listServers(p)
+			servers, err := listServers(p, logger) // Pass logger here
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(servers); err != nil {
-				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+				http.Error(w, "DynamicServerAPI: Failed to encode response to JSON, make sure you are using the proper format.", http.StatusInternalServerError)
 				return
 			}
 		} else {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+			http.Error(w, "DynamicServerAPI: Invalid request method, you need to use GET.", http.StatusMethodNotAllowed)
 		}
 	}))
 
-	serverAddr := ":8080"
-	logger.Info("Starting REST API server", "address", serverAddr)
+	serverAddr := fmt.Sprintf("%s:%d", apiInterface, apiPort)
+	logger.Info("DynamicServerAPI: Starting REST API server at:", "address", serverAddr)
 	if err := http.ListenAndServe(serverAddr, nil); err != nil {
-		logger.Error(err, "Failed to start REST API server")
+		logger.Error(err, "DynamicServerAPI: Failed to start REST API server")
 	}
 }
 
@@ -165,25 +249,27 @@ func decodeJSONBody(r *http.Request, v interface{}) error {
 }
 
 // addServer adds a new server to the proxy.
-func addServer(p *proxy.Proxy, name, address string) error {
+func addServer(p *proxy.Proxy, name, address string, fallback bool) error {
 	serverMutex.Lock()
 	defer serverMutex.Unlock()
 
 	serverAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
-		return fmt.Errorf("invalid address: %v", err)
+		return fmt.Errorf("DynamicServerAPI: invalid address: %v", err)
 	}
 
 	serverInfo := &ConcreteServerInfo{name: name, address: serverAddr}
 
-	result, err := p.Register(serverInfo) // Handle both return values
+	result, err := p.Register(serverInfo)
 	if err != nil {
 		return err
 	}
 	_ = result // Optionally use result
+
 	return nil
 }
 
+// removeServer removes a server from the proxy.
 func removeServer(p *proxy.Proxy, name string) error {
 	serverMutex.Lock()
 	defer serverMutex.Unlock()
@@ -193,15 +279,14 @@ func removeServer(p *proxy.Proxy, name string) error {
 	for _, server := range servers {
 		serverInfo := server.ServerInfo()
 		if serverInfo.Name() == name {
-			// Unregister returns a boolean indicating success
 			if success := p.Unregister(serverInfo); !success {
-				return fmt.Errorf("failed to unregister server: server not found")
+				return fmt.Errorf("DynamicServerAPI: failed to unregister server: server not found")
 			}
 			return nil
 		}
 	}
 
-	return fmt.Errorf("server %s not found", name)
+	return fmt.Errorf("DynamicServerAPI: server %s not found", name)
 }
 
 // saveServersToFile saves the servers to the file while preserving the auth token.
@@ -211,76 +296,98 @@ func saveServersToFile(p *proxy.Proxy, newServer *Server, removedServer *Server)
 
 	var serverList []Server
 
-	// Read existing servers from the file
+	// Open the existing configuration file
 	file, err := os.Open(serversFile)
 	if err == nil {
 		defer file.Close()
 		var existingConfig struct {
-			AuthToken string   `json:"auth_token"`
-			Servers   []Server `json:"servers"`
+			AuthToken     string   `json:"auth_token"`
+			API_Port      int      `json:"api_port"`
+			API_Interface string   `json:"api_interface"`
+			Servers       []Server `json:"servers"`
 		}
 		decoder := json.NewDecoder(file)
 		if err := decoder.Decode(&existingConfig); err == nil {
-			// Preserve the existing servers list, but exclude the removed server
+			// Preserve API settings
+			apiPort = existingConfig.API_Port
+			apiInterface = existingConfig.API_Interface
+
+			// Add existing servers to the new list, excluding the removed server
 			for _, server := range existingConfig.Servers {
 				if removedServer == nil || server.Name != removedServer.Name {
-					// Ignore admin servers
 					if !adminServers[server.Name] {
 						serverList = append(serverList, server)
 					}
 				}
 			}
+		} else {
+			return err
 		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 
-	// Add the new server to the list if provided
+	// Add the new server if provided
 	if newServer != nil {
-		// Ignore admin servers
 		if !adminServers[newServer.Name] {
-			serverList = append(serverList, *newServer)
+			// Check for duplicate entries before adding
+			exists := false
+			for _, srv := range serverList {
+				if srv.Name == newServer.Name {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				serverList = append(serverList, *newServer)
+			}
 		}
 	} else {
-		// If no new server is provided, update the list from the proxy servers
+		// If no new server is being added, update with current servers
 		servers := p.Servers()
 		for _, server := range servers {
 			serverInfo := server.ServerInfo()
-			// Ignore admin servers
 			if !adminServers[serverInfo.Name()] {
-				serverList = append(serverList, Server{
-					Name:    serverInfo.Name(),
-					Address: serverInfo.Addr().String(),
-				})
+				// Check for duplicate entries before adding
+				exists := false
+				for _, srv := range serverList {
+					if srv.Name == serverInfo.Name() {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					serverList = append(serverList, Server{
+						Name:     serverInfo.Name(),
+						Address:  serverInfo.Addr().String(),
+						Fallback: false, // Default value for fallback
+					})
+				}
 			}
 		}
 	}
 
-	// Create the file and save the servers list with the auth token
 	config := struct {
-		AuthToken string   `json:"auth_token"`
-		Servers   []Server `json:"servers"`
+		AuthToken     string   `json:"auth_token"`
+		API_Port      int      `json:"api_port"`
+		API_Interface string   `json:"api_interface"`
+		Servers       []Server `json:"servers"`
 	}{
-		AuthToken: authToken,
-		Servers:   serverList,
+		AuthToken:     authToken,
+		API_Port:      apiPort,
+		API_Interface: apiInterface,
+		Servers:       serverList,
 	}
 
-	file, err = os.Create(serversFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	return encoder.Encode(config)
+	// Save the updated configuration with pretty-printing
+	return writeConfigToFile(config)
 }
 
-// loadConfigFromFile loads server list and auth token from a file.
+// loadConfigFromFile loads server list and auth token from a file and validates/updates config if needed.
 func loadConfigFromFile(p *proxy.Proxy) error {
 	file, err := os.Open(serversFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// If the file does not exist, create it with default values
 			authToken = generateAuthToken() // Generate a new token
 			return createDefaultConfigFile()
 		}
@@ -289,72 +396,57 @@ func loadConfigFromFile(p *proxy.Proxy) error {
 	defer file.Close()
 
 	var config struct {
-		AuthToken string   `json:"auth_token"`
-		Servers   []Server `json:"servers"`
+		AuthToken     string   `json:"auth_token,omitempty"`
+		API_Port      int      `json:"api_port,omitempty"`
+		API_Interface string   `json:"api_interface,omitempty"`
+		Servers       []Server `json:"servers,omitempty"`
 	}
+
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
 		return err
 	}
 
+	// Validate and correct configuration
+	if config.AuthToken == "" {
+		config.AuthToken = generateAuthToken()
+	}
+
+	if config.Servers == nil {
+		config.Servers = []Server{}
+	}
+
+	if config.API_Port == 0 {
+		config.API_Port = 8080 // Default port
+	}
+
+	if config.API_Interface == "" {
+		config.API_Interface = "0.0.0.0" // Default interface
+	}
+
+	// Write the corrected config back to the file
+	if err := writeConfigToFile(config); err != nil {
+		return err
+	}
+
 	authToken = config.AuthToken
+	apiPort = config.API_Port
+	apiInterface = config.API_Interface
 
 	for _, server := range config.Servers {
-		if err := addServer(p, server.Name, server.Address); err != nil {
-			return err
+		if !adminServers[server.Name] {
+			err := addServer(p, server.Name, server.Address, server.Fallback)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-// generateAuthToken generates a random authorization token.
-func generateAuthToken() string {
-	const tokenLength = 32
-	tokenBytes := make([]byte, tokenLength)
-
-	// Use crypto/rand for secure random bytes
-	_, err := rand.Read(tokenBytes)
-	if err != nil {
-		// Handle error: log it, use a fallback token, or panic
-		// Here, we'll use a predefined fallback token if an error occurs
-		return "fallback-token-1234567890abcdef"
-	}
-
-	// Encode the bytes in base64
-	token := base64.StdEncoding.EncodeToString(tokenBytes)
-	return token
-}
-
-// listServers lists all servers registered with the proxy.
-func listServers(p *proxy.Proxy) ([]Server, error) {
-	serverMutex.Lock()
-	defer serverMutex.Unlock()
-
-	var serverList []Server
-	servers := p.Servers()
-
-	for _, server := range servers {
-		serverInfo := server.ServerInfo() // Get the ServerInfo
-		serverList = append(serverList, Server{
-			Name:    serverInfo.Name(),
-			Address: serverInfo.Addr().String(),
-		})
-	}
-
-	return serverList, nil
-}
-
-// createDefaultConfigFile creates the default configuration file with an auth token and empty server list.
-func createDefaultConfigFile() error {
-	config := struct {
-		AuthToken string   `json:"auth_token"`
-		Servers   []Server `json:"servers"`
-	}{
-		AuthToken: authToken,
-		Servers:   []Server{},
-	}
-
+// writeConfigToFile writes the given config to the configuration file.
+func writeConfigToFile(config interface{}) error {
 	file, err := os.Create(serversFile)
 	if err != nil {
 		return err
@@ -362,5 +454,185 @@ func createDefaultConfigFile() error {
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // Pretty-print JSON with 2 spaces
 	return encoder.Encode(config)
+}
+
+// createDefaultConfigFile creates a default config file with auth token and default values.
+func createDefaultConfigFile() error {
+	config := struct {
+		AuthToken     string   `json:"auth_token"`
+		API_Port      int      `json:"api_port"`
+		API_Interface string   `json:"api_interface"`
+		Servers       []Server `json:"servers"`
+	}{
+		AuthToken:     generateAuthToken(),
+		API_Port:      8080,
+		API_Interface: "0.0.0.0",
+		Servers:       []Server{}, // Ensure servers section is present
+	}
+
+	return writeConfigToFile(config)
+}
+
+// generateAuthToken generates a new authorization token.
+func generateAuthToken() string {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		panic("DynamicServerAPI: failed to generate random token")
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// listServers returns a list of servers.
+func listServers(p *proxy.Proxy, logger logr.Logger) ([]Server, error) {
+	var serverList []Server
+	servers := p.Servers()
+
+	if len(servers) == 0 {
+		logger.Info("DynamicServerAPI: No servers found.")
+	}
+
+	for _, server := range servers {
+		serverInfo := server.ServerInfo()
+		fallback := isFallbackServer(serverInfo.Name())
+		serverList = append(serverList, Server{
+			Name:     serverInfo.Name(),
+			Address:  serverInfo.Addr().String(),
+			Fallback: fallback,
+		})
+	}
+	return serverList, nil
+}
+
+// onPlayerChooseInitialServer handles the PlayerChooseInitialServerEvent to direct players.
+func onPlayerChooseInitialServer(p *proxy.Proxy, log logr.Logger) func(*proxy.PlayerChooseInitialServerEvent) {
+	return func(e *proxy.PlayerChooseInitialServerEvent) {
+		handlePlayerJoin(p, e, log)
+	}
+}
+
+var fallbackServersMap = make(map[proxy.Player][]proxy.RegisteredServer)
+
+// handlePlayerJoin handles player join events and chooses the server.
+func handlePlayerJoin(p *proxy.Proxy, event *proxy.PlayerChooseInitialServerEvent, log logr.Logger) {
+	var fallbackServers []proxy.RegisteredServer
+
+	servers := p.Servers()
+	for _, server := range servers {
+		serverInfo := server.ServerInfo()
+		if isFallbackServer(serverInfo.Name()) {
+			fallbackServers = append(fallbackServers, server)
+		}
+	}
+
+	if len(fallbackServers) > 0 {
+		// Set the initial server to the first fallback server
+		event.SetInitialServer(fallbackServers[0])
+
+		// Track player and fallback servers for redirection
+		player := event.Player()
+		fallbackServersMap[player] = fallbackServers
+	} else {
+		// No fallback servers available
+		msg := "There are currently no available fallback servers. Please try again later."
+		log.Info(msg)
+		player := event.Player()
+		player.Disconnect(&component.Text{Content: msg})
+	}
+}
+
+func onKickedFromServer(p *proxy.Proxy, log logr.Logger) func(*proxy.KickedFromServerEvent) {
+	return func(e *proxy.KickedFromServerEvent) {
+		handlePlayerKick(p, e, log)
+	}
+}
+
+var (
+	redirectAttempts = make(map[proxy.Player]int)
+	mu               sync.Mutex // Declare mutex here
+)
+
+func handlePlayerKick(p *proxy.Proxy, event *proxy.KickedFromServerEvent, log logr.Logger) {
+	server := event.Server()
+	player := event.Player()
+
+	mu.Lock()
+	attempts, exists := redirectAttempts[player]
+	if !exists {
+		attempts = 0
+	}
+	redirectAttempts[player] = attempts + 1
+	mu.Unlock()
+
+	// Retrieve fallback servers and exclude the current server
+	var fallbackServers []proxy.RegisteredServer
+	servers := p.Servers()
+	for _, s := range servers {
+		if isFallbackServer(s.ServerInfo().Name()) && s != server {
+			fallbackServers = append(fallbackServers, s)
+		}
+	}
+
+	// Check if there are any fallback servers available
+	if len(fallbackServers) == 0 {
+		// No fallback servers available, disconnect player
+		msg := "Unable to connect to any fallback servers. You have been disconnected."
+		log.Info(msg)
+		event.SetResult(&proxy.DisconnectPlayerKickResult{
+			Reason: &component.Text{Content: msg},
+		})
+		return
+	}
+
+	// Attempt to redirect to the next available fallback server
+	if attempts < len(fallbackServers) {
+		fallback := fallbackServers[attempts%len(fallbackServers)]
+		result := &proxy.RedirectPlayerKickResult{
+			Server: fallback,
+		}
+		log.Info("DynamicServerAPI: Attempting to redirect player to server " + fallback.ServerInfo().Name())
+		event.SetResult(result)
+		return
+	}
+
+	// If all attempts are exhausted or maximum attempts reached, disconnect the player
+	msg := "Unable to connect to any fallback servers. You have been disconnected."
+	log.Info(msg)
+	event.SetResult(&proxy.DisconnectPlayerKickResult{
+		Reason: &component.Text{Content: msg},
+	})
+
+	mu.Lock()
+	delete(redirectAttempts, player) // Reset attempts after disconnect
+	mu.Unlock()
+}
+
+// isFallbackServer checks if a server is a fallback server.
+func isFallbackServer(name string) bool {
+	serverMutex.Lock()
+	defer serverMutex.Unlock()
+
+	// Retrieve server list from file or in-memory cache
+	file, err := os.Open(serversFile)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	var config struct {
+		Servers []Server `json:"servers"`
+	}
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return false
+	}
+
+	for _, server := range config.Servers {
+		if server.Name == name {
+			return server.Fallback
+		}
+	}
+	return false
 }
