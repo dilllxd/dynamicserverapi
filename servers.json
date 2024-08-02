@@ -1,7 +1,9 @@
 {
   "auth_token": "your_generated_token",
+  "api_port": 8080,
+  "api_interface": "0.0.0.0",
   "servers": [
-    {"name":"exampleserver1","address":"127.0.0.1:25566"},
-    {"name":"exampleserver2","address":"127.0.0.1:25567"}
+    {"name":"exampleserver1","address":"127.0.0.1:25566","fallback": true},
+    {"name":"exampleserver2","address":"127.0.0.1:25567","fallback": false}
   ]
 }
