@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	CurrentVersion = "1.0.0"
+	CurrentVersion = "1.0.1"
 )
 
 // Mutex for synchronizing server access
@@ -59,7 +59,7 @@ var Plugin = proxy.Plugin{
 		}
 
 		// Load servers from file and set the authorization token.
-		if err := loadConfigFromFile(p); err != nil {
+		if err := loadConfigFromFile(p, logger); err != nil {
 			logger.Error(err, "DynamicServerAPI: Failed to load servers from file")
 			return err
 		}
@@ -384,12 +384,12 @@ func saveServersToFile(p *proxy.Proxy, newServer *Server, removedServer *Server)
 }
 
 // loadConfigFromFile loads server list and auth token from a file and validates/updates config if needed.
-func loadConfigFromFile(p *proxy.Proxy) error {
+func loadConfigFromFile(p *proxy.Proxy, logger logr.Logger) error {
 	file, err := os.Open(serversFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			authToken = generateAuthToken() // Generate a new token
-			return createDefaultConfigFile()
+			return createDefaultConfigFile(logger)
 		}
 		return err
 	}
@@ -410,6 +410,7 @@ func loadConfigFromFile(p *proxy.Proxy) error {
 	// Validate and correct configuration
 	if config.AuthToken == "" {
 		config.AuthToken = generateAuthToken()
+		logger.Info("DynamicServerAPI: Generated new authorization token due to invalid/blank token.", "token", config.AuthToken) // Log the generated token
 	}
 
 	if config.Servers == nil {
@@ -459,7 +460,7 @@ func writeConfigToFile(config interface{}) error {
 }
 
 // createDefaultConfigFile creates a default config file with auth token and default values.
-func createDefaultConfigFile() error {
+func createDefaultConfigFile(logger logr.Logger) error {
 	config := struct {
 		AuthToken     string   `json:"auth_token"`
 		API_Port      int      `json:"api_port"`
@@ -472,6 +473,10 @@ func createDefaultConfigFile() error {
 		Servers:       []Server{}, // Ensure servers section is present
 	}
 
+	// Log the generated token
+	logger.Info("DynamicServerAPI: Generated new authorization token due to config being generated.", "token", config.AuthToken)
+
+	// Write the config to file
 	return writeConfigToFile(config)
 }
 
