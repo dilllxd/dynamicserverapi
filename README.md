@@ -139,4 +139,14 @@ curl -X GET http://localhost:8080/listservers \
 - **REST API:** REST API port and address are fully configurable now as of v1.0.0.
 ---
 
+## Version History
+
+### v1.0.0 - Initial Release (August 2nd, 2024)
+- Initial release of the DynamicServerAPI plugin.
+- Full functionality to add, remove, and list servers via a REST API.
+
+### v1.0.1 - Minor Release (November 11th, 2024)
+- Added logging to token generation for easier retrieval when a token is generated.
+---
+
 Feel free to reach out if you have any questions or need further assistance with setting up the DynamicServerAPI plugin for Gate.
